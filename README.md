@@ -360,6 +360,3 @@ For questions or support, please open an issue on GitHub.
 ---
 
 **Happy Budgeting!** 💰📊
-#   B u d g e t _ P l a n n e r - p a r t 2  
- #   B u d g e t _ P l a n n e r - p a r t 2  
- 
