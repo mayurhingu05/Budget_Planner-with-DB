@@ -111,14 +111,21 @@ def user_doc_to_view(doc):
 def transaction_doc_to_view(doc):
     if not doc:
         return None
+
+    date_value = doc.get('date')
+    if isinstance(date_value, datetime):
+        date_value = date_value.strftime('%Y-%m-%d')
+    elif date_value is None:
+        date_value = ''
+
     return {
         'id': str(doc['_id']),
         'user_id': doc['user_id'],
         'type': doc['type'],
         'category': doc['category'],
-        'amount': float(doc['amount']),
+        'amount': float(doc.get('amount') or 0),
         'description': doc.get('description') or '',
-        'date': doc['date'],
+        'date': date_value,
         'created_at': doc.get('created_at'),
     }
 
@@ -168,9 +175,17 @@ def get_user_data(user_id):
     return user_doc_to_view(doc)
 
 
+def get_user_filter(user_id):
+    """Return a filter matching the current user by string or ObjectId."""
+    oid = object_id(user_id)
+    if oid is None:
+        return {'user_id': user_id}
+    return {'user_id': {'$in': [oid, user_id]}}
+
+
 def get_transactions(user_id, limit=None, date_from=None, date_to=None, category=None, search=None):
     """Get transactions with optional filters"""
-    flt = {'user_id': user_id}
+    flt = get_user_filter(user_id)
 
     date_range = {}
     if date_from:
@@ -203,7 +218,7 @@ def get_transactions(user_id, limit=None, date_from=None, date_to=None, category
 
 def get_financial_summary(user_id):
     """Calculate financial summary for user"""
-    txs = list(mongo_db.transactions.find({'user_id': user_id}))
+    txs = list(mongo_db.transactions.find(get_user_filter(user_id)))
 
     total_income = sum(t['amount'] for t in txs if t['type'] == 'income')
     total_expenses = sum(t['amount'] for t in txs if t['type'] == 'expense')
@@ -489,7 +504,7 @@ def transactions():
     )
 
     categories = sorted(
-        mongo_db.transactions.distinct('category', {'user_id': user_id})
+        mongo_db.transactions.distinct('category', get_user_filter(user_id))
     )
 
     return render_template(
@@ -509,22 +524,34 @@ def add_transaction():
     """Add new transaction"""
     user_id = session['user_id']
 
-    transaction_type = request.form.get('type')
-    category = request.form.get('category')
-    amount = float(request.form.get('amount', 0))
-    date = request.form.get('date')
-    description = request.form.get('description', '')
+    transaction_type = request.form.get('type', 'expense')
+    category = request.form.get('category', 'Other').strip() or 'Other'
+    description = request.form.get('description', '').strip()
+
+    try:
+        amount = float(request.form.get('amount', 0))
+    except ValueError:
+        amount = 0.0
+
+    date_value = request.form.get('date', '').strip()
+    try:
+        if date_value:
+            datetime.strptime(date_value, '%Y-%m-%d')
+        else:
+            raise ValueError
+    except ValueError:
+        date_value = datetime.now().strftime('%Y-%m-%d')
 
     if amount <= 0:
         flash('Amount must be greater than 0', 'danger')
         return redirect(url_for('dashboard'))
 
     mongo_db.transactions.insert_one({
-        'user_id': user_id,
+        'user_id': object_id(user_id) or user_id,
         'type': transaction_type,
         'category': category,
-        'amount': amount,
-        'date': date,
+        'amount': round(amount, 2),
+        'date': date_value,
         'description': description,
         'created_at': datetime.utcnow(),
     })
@@ -543,7 +570,7 @@ def delete_transaction(transaction_id):
         flash('Invalid transaction', 'danger')
         return redirect(url_for('transactions'))
 
-    result = mongo_db.transactions.delete_one({'_id': oid, 'user_id': user_id})
+    result = mongo_db.transactions.delete_one({'_id': oid, **get_user_filter(user_id)})
     if result.deleted_count:
         flash('Transaction deleted successfully!', 'success')
     else:
@@ -627,10 +654,22 @@ def savings_goals():
     """Savings goals page"""
     user_id = session['user_id']
 
-    cursor = mongo_db.savings_goals.find({'user_id': user_id}).sort('created_at', -1)
+    cursor = mongo_db.savings_goals.find(get_user_filter(user_id)).sort('created_at', -1)
     goals = [goal_doc_to_view(g) for g in cursor]
 
-    return render_template('savings_goals.html', goals=goals)
+    total_target = sum(goal['target_amount'] for goal in goals)
+    total_saved = sum(goal['current_amount'] for goal in goals)
+    active_goals = len(goals)
+    completed_goals = sum(1 for goal in goals if goal['current_amount'] >= goal['target_amount'] > 0)
+
+    return render_template(
+        'savings_goals.html',
+        goals=goals,
+        total_target=total_target,
+        total_saved=total_saved,
+        active_goals=active_goals,
+        completed_goals=completed_goals,
+    )
 
 
 @app.route('/add_savings_goal', methods=['POST'])
@@ -640,17 +679,21 @@ def add_savings_goal():
     user_id = session['user_id']
 
     name = request.form.get('name', '').strip()
-    target_amount = float(request.form.get('target_amount', 0))
-    deadline = request.form.get('deadline', '')
+    deadline = request.form.get('deadline', '').strip()
+
+    try:
+        target_amount = float(request.form.get('target_amount', 0))
+    except (TypeError, ValueError):
+        target_amount = 0.0
 
     if not name or target_amount <= 0:
         flash('Please provide valid goal name and target amount', 'danger')
         return redirect(url_for('savings_goals'))
 
     mongo_db.savings_goals.insert_one({
-        'user_id': user_id,
+        'user_id': object_id(user_id) or user_id,
         'name': name,
-        'target_amount': target_amount,
+        'target_amount': round(target_amount, 2),
         'current_amount': 0.0,
         'deadline': deadline if deadline else None,
         'created_at': datetime.utcnow(),
@@ -673,7 +716,7 @@ def update_goal_progress(goal_id):
         return redirect(url_for('savings_goals'))
 
     result = mongo_db.savings_goals.update_one(
-        {'_id': oid, 'user_id': user_id},
+        {'_id': oid, **get_user_filter(user_id)},
         {'$inc': {'current_amount': amount}},
     )
     if result.matched_count:
@@ -694,7 +737,7 @@ def delete_goal(goal_id):
         flash('Invalid goal', 'danger')
         return redirect(url_for('savings_goals'))
 
-    result = mongo_db.savings_goals.delete_one({'_id': oid, 'user_id': user_id})
+    result = mongo_db.savings_goals.delete_one({'_id': oid, **get_user_filter(user_id)})
     if result.deleted_count:
         flash('Goal deleted successfully!', 'success')
     else:
@@ -719,7 +762,7 @@ def export_pdf():
     date_end = f'{current_month}-{last_day:02d}'
 
     cursor = mongo_db.transactions.find({
-        'user_id': user_id,
+        **get_user_filter(user_id),
         'date': {'$gte': date_start, '$lte': date_end},
     }).sort([('date', -1)])
     month_transactions = [transaction_doc_to_view(t) for t in cursor]
@@ -794,20 +837,26 @@ def server_error(error):
 def format_currency(value):
     """Format number as currency"""
     if value is None:
-        return '��0.00'
-    return f'��{value:,.2f}'
+        return '₹0.00'
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return '₹0.00'
+    return f'₹{num:,.2f}'
 
 
 @app.template_filter('format_date')
 def format_date(value):
     """Format date string"""
-    if isinstance(value, str):
+    if isinstance(value, datetime):
+        return value.strftime('%b %d, %Y')
+    if isinstance(value, str) and value:
         try:
             dt = datetime.strptime(value, '%Y-%m-%d')
             return dt.strftime('%b %d, %Y')
         except ValueError:
             return value
-    return value
+    return ''
 
 
 if __name__ == '__main__':
