@@ -77,7 +77,7 @@
                 </div>
                 <div class="goal-actions">
                     {% if not is_completed %}
-                    <button class="btn-icon" onclick='openUpdateProgressModal({{ goal.id }}, {{ goal.name|tojson }})' title="Add Progress">
+                    <button class="btn-icon" onclick='openUpdateProgressModal({{ goal.id|tojson }}, {{ goal.name|tojson }})' title="Add Progress">
                         <i class="fas fa-plus"></i>
                     </button>
                     {% endif %}
