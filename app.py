@@ -27,16 +27,22 @@ from flask import (
     session,
     url_for,
 )
+import anthropic
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from werkzeug.security import check_password_hash, generate_password_hash
 
-load_dotenv()
+_dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+load_dotenv(dotenv_path=_dotenv_path, override=True)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here-change-in-production')
 app.config['MONGODB_URI'] = os.environ.get('MONGODB_URI', '')
 app.config['MONGODB_DB_NAME'] = os.environ.get('MONGODB_DB_NAME', 'budget_db')
+app.config['CLAUDE_API_KEY'] = os.environ.get('CLAUDE_API_KEY', '')
+
+print("Claude API key loaded:", bool(app.config['CLAUDE_API_KEY']))
+print("Claude API key repr:", repr(os.getenv("CLAUDE_API_KEY")))
 
 mongo_client = None
 mongo_db = None
@@ -273,12 +279,108 @@ def get_financial_summary(user_id):
 
 
 def generate_ai_advice(user_id):
-    """Generate AI financial advice based on spending patterns"""
+    """Generate AI financial advice using Claude based on spending patterns"""
+    try:
+        summary = get_financial_summary(user_id)
+
+        # Prepare financial data for AI analysis
+        financial_data = {
+            'monthly_salary': summary['monthly_salary'],
+            'monthly_expenses': summary['monthly_expenses'],
+            'total_expenses': summary['total_expenses'],
+            'balance': summary['balance'],
+            'remaining_budget': summary['remaining_budget'],
+            'daily_spending_limit': summary['daily_spending_limit'],
+            'days_remaining': summary['days_remaining'],
+            'category_expenses': summary['category_expenses']
+        }
+
+        # Create prompt for AI
+        prompt = f"""
+You are a professional financial advisor. Analyze this user's financial data and provide 3-5 specific, actionable pieces of advice.
+
+Financial Data:
+- Monthly Salary: ₹{financial_data['monthly_salary']:.2f}
+- Monthly Expenses: ₹{financial_data['monthly_expenses']:.2f}
+- Current Balance: ₹{financial_data['balance']:.2f}
+- Remaining Budget: ₹{financial_data['remaining_budget']:.2f}
+- Daily Spending Limit: ₹{financial_data['daily_spending_limit']:.2f}
+- Days Remaining in Month: {financial_data['days_remaining']}
+
+Category Breakdown:
+"""
+
+        # Calculate total for percentages
+        total_expenses = sum(cat['total'] for cat in financial_data['category_expenses']) or 1
+
+        for cat in financial_data['category_expenses'][:5]:  # Top 5 categories
+            percentage = (cat['total'] / total_expenses) * 100
+            prompt += f"- {cat['category']}: ₹{cat['total']:.2f} ({percentage:.1f}%)\n"
+
+        prompt += """
+Provide advice in JSON format with this structure:
+[
+  {
+    "type": "success|warning|danger|info",
+    "icon": "check-circle|alert-triangle|warning|info|piggy-bank|trending-up",
+    "title": "Brief title",
+    "message": "Detailed advice message"
+  }
+]
+
+Focus on:
+1. Budget management and savings
+2. Spending pattern analysis
+3. Investment opportunities
+4. Financial goals
+5. Emergency preparedness
+
+Be encouraging and specific. Use Indian Rupees (₹) in examples.
+"""
+
+        if not os.getenv("CLAUDE_API_KEY"):
+            raise Exception("Claude API key missing")
+
+        client = anthropic.Anthropic(
+            api_key=os.getenv("CLAUDE_API_KEY")
+        )
+
+        response = client.messages.create(
+            model="claude-opus-4-1-20250805",
+            max_tokens=800,
+            system="You are a helpful financial advisor providing personalized advice.",
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        advice_text = response.content[0].text.strip()
+
+        # Try to parse as JSON
+        try:
+            import json
+            advice = json.loads(advice_text)
+            return advice
+        except json.JSONDecodeError:
+            # If JSON parsing fails, create structured advice from text
+            return [{
+                'type': 'info',
+                'icon': 'info',
+                'title': 'AI Financial Advice',
+                'message': advice_text
+            }]
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # Fallback to basic advice
+        return generate_basic_advice(user_id)
+
+
+def generate_basic_advice(user_id):
+    """Fallback basic advice when Gemini is not available"""
     summary = get_financial_summary(user_id)
     advice = []
-
-    category_expenses = summary['category_expenses']
-    category_dict = {item['category']: item['total'] for item in category_expenses}
 
     total_expenses = summary['total_expenses']
     monthly_salary = summary['monthly_salary']
@@ -316,21 +418,6 @@ def generate_ai_advice(user_id):
                 'message': 'You are saving more than 50% of your income. Great financial discipline!',
             })
 
-    if total_expenses > 0:
-        for cat_name, amount in category_dict.items():
-            percentage = (amount / total_expenses) * 100
-
-            if percentage > 40:
-                advice.append({
-                    'type': 'warning',
-                    'icon': 'trending-up',
-                    'title': f'High {cat_name} Spending',
-                    'message': (
-                        f'{cat_name} accounts for {percentage:.1f}% of your total expenses. '
-                        'Consider reducing spending in this category.'
-                    ),
-                })
-
     if balance < 0:
         advice.append({
             'type': 'danger',
@@ -339,22 +426,6 @@ def generate_ai_advice(user_id):
             'message': (
                 'Your expenses exceed your income. Create a strict budget and cut unnecessary spending immediately.'
             ),
-        })
-    elif balance > monthly_salary * 3:
-        advice.append({
-            'type': 'info',
-            'icon': 'piggy-bank',
-            'title': 'Investment Opportunity',
-            'message': 'You have a healthy surplus. Consider investing in stocks, mutual funds, or retirement accounts.',
-        })
-
-    daily_limit = summary['daily_spending_limit']
-    if daily_limit < 10 and monthly_salary > 0:
-        advice.append({
-            'type': 'warning',
-            'icon': 'clock',
-            'title': 'Low Daily Budget',
-            'message': f'Your daily spending limit is only ₹{daily_limit:.2f} for the rest of the month.',
         })
 
     if not advice:
@@ -463,6 +534,84 @@ def logout():
     session.clear()
     flash('You have been logged out', 'info')
     return redirect(url_for('login'))
+
+
+@app.route('/ai_assistant')
+@login_required
+def ai_assistant():
+    """AI Assistant page"""
+    user_id = session['user_id']
+    user = get_user_data(user_id)
+    return render_template('ai_assistant.html', user=user)
+
+
+@app.route('/api/chat', methods=['POST'])
+@login_required
+def chat_with_ai():
+    """API endpoint for AI chat"""
+    try:
+        user_id = session['user_id']
+        data = request.get_json()
+        user_message = data.get('message', '').strip()
+
+        if not user_message:
+            return jsonify({'error': 'Message cannot be empty'}), 400
+
+        # Get user's financial context
+        summary = get_financial_summary(user_id)
+        user_data = get_user_data(user_id)
+
+        # Create context for AI
+        context = f"""
+User's Financial Profile:
+- Monthly Salary: ₹{summary['monthly_salary']:.2f}
+- Monthly Expenses: ₹{summary['monthly_expenses']:.2f}
+- Current Balance: ₹{summary['balance']:.2f}
+- Username: {user_data['username']}
+
+Recent spending categories:
+"""
+
+        for cat in summary['category_expenses'][:3]:
+            context += f"- {cat['category']}: ₹{cat['total']:.2f}\n"
+
+        # Create prompt
+        prompt = f"""
+You are a helpful AI financial assistant for a budget tracking app. Help users with financial questions, budgeting advice, and money management.
+
+User's financial context:
+{context}
+
+User's question: {user_message}
+
+Provide helpful, personalized advice. Be encouraging and specific. Use Indian Rupees (₹) in examples when discussing money.
+Keep responses conversational but informative.
+"""
+
+        if not os.getenv("CLAUDE_API_KEY"):
+            raise Exception("Claude API key missing")
+
+        client = anthropic.Anthropic(
+            api_key=os.getenv("CLAUDE_API_KEY")
+        )
+
+        response = client.messages.create(
+            model="claude-opus-4-1-20250805",
+            max_tokens=800,
+            system="You are a helpful AI financial assistant for a budget tracking app.",
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        ai_response = response.content[0].text.strip()
+
+        return jsonify({'response': ai_response})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/dashboard')
@@ -708,7 +857,15 @@ def add_savings_goal():
 def update_goal_progress(goal_id):
     """Update savings goal progress"""
     user_id = session['user_id']
-    amount = float(request.form.get('amount', 0))
+    
+    try:
+        amount = float(request.form.get('amount', 0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    
+    if amount <= 0:
+        flash('Amount must be greater than 0', 'danger')
+        return redirect(url_for('savings_goals'))
 
     oid = object_id(goal_id)
     if oid is None:
