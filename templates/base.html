@@ -54,6 +54,9 @@
                 <li><a href="{{ url_for('savings_goals') }}" class="{% if request.endpoint == 'savings_goals' %}active{% endif %}">
                     <i class="fas fa-bullseye"></i> Goals
                 </a></li>
+                <li><a href="{{ url_for('ai_assistant') }}" class="{% if request.endpoint == 'ai_assistant' %}active{% endif %}">
+                    <i class="fas fa-robot"></i> AI Assistant
+                </a></li>
                 <li><a href="{{ url_for('profile') }}" class="{% if request.endpoint == 'profile' %}active{% endif %}">
                     <i class="fas fa-user"></i> Profile
                 </a></li>
